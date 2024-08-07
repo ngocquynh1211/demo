@@ -1,0 +1,1 @@
+bin/vmware-uninstall-vSphere-CLI.pl

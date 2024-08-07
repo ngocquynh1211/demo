@@ -1,0 +1,251 @@
+#!/bin/bash
+
+DIR="/root"
+HOSTNAME=$(hostname --fqdn)
+INSTALL_DIR="$DIR/monitor-packages"
+LOG_DIR="/var/log/monitor-packages"
+LOG_FILE="$LOG_DIR/install.log"
+ICINGA2_USER="nagios"
+PLUGIN_DIR="/usr/lib/nagios/plugins"
+CPAN_MODULES="IO::Socket::SSL Pod::Find Sys::Statistics::Linux Readonly Nagios::Monitoring::Plugin Monitoring::Plugin JSON::XS Net::LDAP Data::Dump WWW::Selenium::Util Test::Harness::Straps Shell LWPx::TimedHTTP WWW::Mechanize::Timed Proc::ProcessTable inc::Module::Install SMS::AQL Net::Amazon::EC2 Net::Amazon::S3"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "You are not running with root permission. Please change to root to install required packages"
+  exit 1
+fi
+
+# Create log directory and file
+mkdir -p $LOG_DIR
+touch $LOG_FILE
+exec &> >(tee -a "$LOG_FILE")
+
+echo "Checking Linux platform"
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  OS=$ID
+  VER=$VERSION_ID
+else
+  echo "Could not determine distribution. Exiting!"
+  exit 1
+fi
+
+if [ "$OS" != "ubuntu" ] || [ "$VER" != "22.04" ]; then
+  echo "Not supported distribution. Exiting!"
+  exit 1
+fi
+
+#-----------------------------------------------------#
+### Install pre-components
+#-----------------------------------------------------#
+echo "Installing pre-requisite components"
+apt-get update -y && apt-get upgrade -y
+apt-get install -y sudo wget unzip mc net-tools git curl nano ntp jq dos2unix mailutils psmisc nfs-common snmp debianutils python3-pip libdbd-mysql-perl build-essential unzip libxml-libxml-perl cpanminus
+pip3 install pysnmp
+
+# Enable time sync
+apt-get install -y ntp
+systemctl enable ntp
+systemctl start ntp
+
+# MySQL Installation
+apt-get install -y mariadb-server
+systemctl start mariadb && systemctl enable mariadb
+ufw allow mysql
+ufw reload
+
+# Install Icinga2 repository
+apt-get install -y apt-transport-https gnupg
+wget -O - https://packages.icinga.com/icinga.key | gpg --dearmor -o /usr/share/keyrings/icinga-archive-keyring.gpg
+
+DIST=${UBUNTU_CODENAME:-$(lsb_release -c | awk '{print $2}')}
+echo "deb [signed-by=/usr/share/keyrings/icinga-archive-keyring.gpg] https://packages.icinga.com/ubuntu icinga-${DIST} main" | tee /etc/apt/sources.list.d/${DIST}-icinga.list
+echo "deb-src [signed-by=/usr/share/keyrings/icinga-archive-keyring.gpg] https://packages.icinga.com/ubuntu icinga-${DIST} main" | tee -a /etc/apt/sources.list.d/${DIST}-icinga.list
+
+apt-get update
+apt-get install -y icinga2 nagios-plugins nagios-nrpe-server nagios-nrpe-plugin libnet-snmp-perl libxml-libxml-perl libjson-perl libwww-perl libxml-xpath-perl libnet-telnet-perl libnet-dns-perl libdbi-perl libdbd-mysql-perl build-essential e2fsprogs uuid-dev libssl-dev libperl-dev zlib1g-dev libncurses5 libcrypt-ssleay-perl openjdk-11-jdk make libxml2-dev libexpat1-dev
+
+# Enable Icinga2
+icinga2 daemon -C
+
+# Install CPAN modules
+echo "Installing CPAN modules"
+cpanm --notest $CPAN_MODULES
+
+# Install Centreon Plugin
+if [ ! -d "${PLUGIN_DIR}/thirdparty/centreon-plugins" ]; then
+    echo "Installing centreon plugins"
+    mkdir -p ${PLUGIN_DIR}/thirdparty
+    cd ${PLUGIN_DIR}/thirdparty
+    cp ${INSTALL_DIR}/thirdparty/centreon-plugins-20190111.tar.gz ./
+    tar -zvxf centreon-plugins-20190111.tar.gz
+    mv centreon-plugins-20190111 centreon-plugins
+    cd centreon-plugins
+    chmod +x centreon_plugins.pl
+    mkdir -p /var/lib/centreon/centplugins
+    chown -R ${ICINGA2_USER}:${ICINGA2_USER} /var/lib/centreon/
+fi
+
+# Install Check WMI Plus Plugin
+if [ ! -f "${PLUGIN_DIR}/check_wmi_plus.pl" ]; then
+    echo "Installing check_wmi_plus"
+    cpanm --notest Config::IniFiles Getopt::Long DateTime Number::Format Data::Dumper Scalar::Util Storable
+    cd ${PLUGIN_DIR}
+    cp ${INSTALL_DIR}/thirdparty/check_wmi_plus.v1.64.tar.gz ./
+    tar -zvxf check_wmi_plus.v1.64.tar.gz		
+    chmod +x check_wmi_plus.pl
+    # Copy configuration
+    if [ ! -d "/etc/check_wmi_plus" ]; then
+        cp -r etc/check_wmi_plus /etc
+        cp /etc/check_wmi_plus/check_wmi_plus.conf.sample /etc/check_wmi_plus/check_wmi_plus.conf
+        chown -R ${ICINGA2_USER}:${ICINGA2_USER} /etc/check_wmi_plus
+        sed -i 's|^$base_dir=|$base_dir="/usr/lib/nagios/plugins"; #|' /etc/check_wmi_plus/check_wmi_plus.conf
+    fi 
+fi
+
+# Install Check NWC Health Plugin
+if [ ! -f "${PLUGIN_DIR}/check_nwc_health" ]; then
+    echo "Installing check_nwc_health"
+    cd ${PLUGIN_DIR}
+    cp ${INSTALL_DIR}/thirdparty/check_nwc_health-7.10.0.4.1.tar.gz ./
+    tar -zvxf check_nwc_health-7.10.0.4.1.tar.gz
+    cd check_nwc_health-7.10.0.4.1
+    ./configure
+    make
+    make check
+    cp plugins-scripts/check_nwc_health ../
+    cd ../
+    chmod +x check_nwc_health
+fi
+
+# Install VMware SDK
+if [ ! -f "/usr/lib/vmware-vcli/apps/vm/guestinfo.pl" ]; then
+    echo "Installing VMWare SDK"
+    cpanm --notest UUID Time::Duration File::Basename HTTP::Date Getopt::Long Time::HiRes IO::Compress::Zlib::Extra
+    cpanm --notest Time::Piece Archive::Zip Text::Template Path::Class LWP::Protocol::https Net::INET6Glue
+    cpanm --notest IO::Socket::INET6
+    cd ${INSTALL_DIR}
+    tar -zvxf vmware/VMware-vSphere-Perl-SDK-6.7.0-8156551.x86_64.tar.gz
+    cd vmware-vsphere-cli-distrib
+    ./vmware-install.pl
+    cd /usr/share/perl5/VMware
+    cp VICommon.pm VICommon.pm.org
+    cp -f ${INSTALL_DIR}/VICommon.pm ./
+fi
+
+# Install check_vmware plugin
+if [ ! -f "${PLUGIN_DIR}/check_vmware_esx" ]; then
+    echo "Installing check_vmware_esx. Please make sure Vsphere SDK installed and worked before!"
+    cd ${PLUGIN_DIR}
+    git clone https://github.com/BaldMansMojo/check_vmware_esx.git check_vmware_esx.d
+    cd check_vmware_esx.d
+    make
+    cp check_vmware_esx ../
+fi
+
+# Install check_jmx plugin
+if [ ! -d "${PLUGIN_DIR}/thirdparty/nagios-jmx-plugin" ]; then
+    echo "Installing check_jmx"
+    cd ${PLUGIN_DIR}/thirdparty
+    cp ${INSTALL_DIR}/thirdparty/nagios-jmx-plugin.zip ./
+    unzip nagios-jmx-plugin.zip
+    mv nagios-jmx-plugin-1.2.3 nagios-jmx-plugin
+    cd nagios-jmx-plugin
+    cp -f ${INSTALL_DIR}/check_jmx/check_jmx ./
+    cp -f ${INSTALL_DIR}/check_jmx/jboss-client-eap-7.2.jar ./
+    dos2unix check_jmx
+    chmod +x check_jmx
+fi
+
+# Install monitor-plugins
+# Install monitor-plugins
+if [ ! -d "${PLUGIN_DIR}/thirdparty/monitor-plugins" ]; then
+    echo "Installing monitor-plugins"
+    cd ${PLUGIN_DIR}/thirdparty
+    git clone https://monitor:6BVvApGryKPHCECSxQzn@tsd-repo.netnam.vn/monitoring/monitor-plugins.git
+
+    # Ensure the sudoers.d directory exists
+    if [ ! -d /etc/sudoers.d ]; then
+        mkdir /etc/sudoers.d
+        chmod 755 /etc/sudoers.d
+    fi
+
+    echo "${ICINGA2_USER} ALL=(root) NOPASSWD: ${PLUGIN_DIR}/thirdparty/monitor-plugins/plugin-update.sh" | EDITOR='tee -a' visudo -f /etc/sudoers.d/monitor-plugins
+    echo "${ICINGA2_USER} ALL=(root) NOPASSWD: ${PLUGIN_DIR}/thirdparty/monitor-plugins/icinga2-validation.sh" | EDITOR='tee -a' visudo -f /etc/sudoers.d/icinga2
+fi
+# Install check_yum_updates
+if [ ! -f "${PLUGIN_DIR}/check_updates" ]; then
+    echo "Installing check_updates"
+    cpanm --notest Readonly Monitoring::Plugin
+    cd ${PLUGIN_DIR}
+    cp ${INSTALL_DIR}/thirdparty/check_updates-1.6.23.tar.gz ./
+    tar -zvxf check_updates-1.6.23.tar.gz
+    cd check_updates-1.6.23
+    perl Makefile.PL
+    make
+    cp blib/script/check_updates ../
+    cd ..
+    chmod +x check_updates
+fi
+
+# Install proxysql-nagios
+if [ ! -d "${PLUGIN_DIR}/thirdparty/proxysql-nagios" ]; then
+    echo "Installing proxysql-nagios"
+    cd ${PLUGIN_DIR}/thirdparty
+    git clone https://github.com/sysown/proxysql-nagios.git
+    # Install dependencies
+    apt-get install -y python3-mysqldb
+fi
+
+# Install Check Oracle health
+if [ ! -f "${PLUGIN_DIR}/check_oracle_health" ]; then
+    echo "Installing perl-DBD-Oracle"
+    apt-get install -y libdbd-oracle-perl
+    echo "Installing check_oracle_health"
+    cd ${PLUGIN_DIR}
+    cp ${INSTALL_DIR}/thirdparty/check_oracle_health-3.2.tar.gz ./
+    tar -zvxf check_oracle_health-3.2.tar.gz
+    cd check_oracle_health-3.2
+    ./configure
+    make
+    make check
+    cp plugins-scripts/check_oracle_health ../
+    cd ../
+    chmod +x check_oracle_health
+    # Setup default environment variable
+    cat >> /etc/environment <<-END
+PATH=$PATH:/usr/lib/oracle/12.2/client64/bin
+iLD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/oracle/12.2/client64/lib
+ORACLE_HOME=/usr/lib/oracle/12.2/client64
+TNS_ADMIN=$ORACLE_HOME/network/admin
+END
+fi
+
+# Install check_mssql_health
+if [ ! -f "${PLUGIN_DIR}/check_mssql_health" ]; then
+    echo "Installing DBD::Sybase"
+    apt-get install -y libdbd-sybase-perl
+    echo "Install check_mssql_health"
+    cd ${PLUGIN_DIR}
+    wget https://labs.consol.de/assets/downloads/nagios/check_mssql_health-2.6.4.15.tar.gz
+    tar -zvxf check_mssql_health-2.6.4.15.tar.gz
+    cd check_mssql_health-2.6.4.15
+    ./configure --with-nagios-user=${ICINGA2_USER} --with-nagios-group=${ICINGA2_USER}
+    make
+    cp plugins-scripts/check_mssql_health ../
+fi
+
+# Copy local perl modules to global path
+echo "Copy local perl modules to global path"
+mkdir -p /usr/local/share/perl5
+cpanm --local-lib=~/perl5 local::lib
+echo 'eval "$(perl -I$HOME/perl5/lib/perl5 -Mlocal::lib=$HOME/perl5)"' >> ~/.bashrc
+source ~/.bashrc
+cp -nru ~/perl5/lib/perl5/*  /usr/local/share/perl5/
+cp -nru /root/perl5/lib/perl5/x86_64-linux-gnu-thread-multi/* /usr/local/share/perl5/
+
+# Restart Icinga2 and set up API
+systemctl restart icinga2
+icinga2 api setup
+
+echo "Installation complete. Check the log file at $LOG_FILE"
+
